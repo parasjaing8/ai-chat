@@ -1,0 +1,8 @@
+.env
+.venv/
+chat.db
+projects/
+memory/
+__pycache__/
+*.pyc
+.claude/
