@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **multi-agent AI orchestration platform** — a group chat + automated project builder running as a FastAPI server on a headless Mac Mini (192.168.0.130:8080). Users interact via browser; AI agents (Claude, DeepSeek, Qwen) collaborate to plan and build web projects automatically.
 
+The backend is designed to be **fully flexible**: Claude can be toggled offline at any time, with Qwen taking over as the master orchestrator. Any LLM can act as planner, evaluator, or worker depending on availability and task type.
+
 ## Running the Server
 
 **On the Mac Mini (remote):**
@@ -32,26 +34,73 @@ No test suite. No lint configuration. There is no build step.
 
 ### Single-file backend: `server.py`
 
-All logic lives in `server.py` (~2200 lines). Key sections:
+All logic lives in `server.py` (~2400 lines). Key sections in order:
 
 | Area | What it does |
 |------|-------------|
-| **Config block** (top) | `OLLAMA_BASE`, `DB_PATH`, `PROJECTS_DIR`, `MEMORY_DIR`, `SERVER_HOST`, model names, pricing constants |
-| **OrchStats** | Tracks token usage + elapsed time across one orchestration run |
+| **Config + `_config`** | Constants, `OLLAMA_MODELS`, `SERVER_HOST`, runtime config dict |
+| **`get_master_model()` / `is_claude_available()`** | Master model routing helpers — central control point |
+| **`OrchStats`** | Token tracking + elapsed time across one orchestration run |
+| **Memory system** | `read_universal_lessons()`, `extract_and_save_lesson()` — lesson extraction via master model |
 | **DB layer** | Raw `sqlite3` — tables: `messages`, `projects`, `project_messages`, `tasks` |
-| **AI callers** | `call_claude()`, `call_ollama()` — async streaming via `httpx` |
-| **Orchestration** | `run_orchestration()` — multi-phase: plan → execute → evaluate → test → complete |
-| **File extraction** | `extract_files_from_response()` — parses 4 code-block formats from agent output |
-| **Project I/O** | `create_project()`, `read_project_files()`, `write_project_files()` |
-| **WebSocket handler** | `/ws` — single entry point for all real-time client communication |
-| **HTTP routes** | REST endpoints for projects CRUD, config, status, settings |
-| **`/play/{slug}`** | Serves project `src/` files with correct MIME types |
+| **Project / Task management** | CRUD helpers, `create_project()`, `slugify()` |
+| **File I/O** | `extract_files_from_response()` (4 parsing patterns), `write_project_files()` |
+| **Git / Devlog** | `git_commit()`, `append_devlog()` |
+| **Streaming** | `stream_claude()`, `stream_ollama()`, **`stream_master()`** (routes to active master) |
+| **`_ollama_json_call()`** | Non-streaming Ollama call for structured JSON output |
+| **`_master_json_call()`** | Routes structured calls to Claude or Qwen depending on `_config` |
+| **Skills system** | `SKILLS_DIR`, `_load_skills(context)` — injects skill content into system prompts |
+| **Intent detection** | `_claude_classify()` → `_master_json_call()`, `detect_intent()` |
+| **Structured planning** | `claude_plan_project()`, `claude_evaluate_task()`, `claude_project_summary()` — all via master model |
+| **Orchestration** | `run_orchestration()`, `_execute_task()`, `run_test_phase()`, `run_fix_task()` |
+| **FastAPI routes** | REST endpoints including `/settings/master`, `/skills` |
+| **WebSocket** | `/ws` — single entry point for all real-time client communication |
 
-### Frontend: `static/index.html`
+### Master Model System
 
-Single-page app (~80KB). Communicates exclusively over WebSocket. Contains the chat UI, project list sidebar, and build-status display.
+`_config` dict (mutable at runtime via API) controls which model orchestrates:
 
-### Data storage
+```python
+_config = {
+    "master_model":   "claude",  # "claude" | "qwen"
+    "claude_enabled": True,      # False = force offline without removing key
+}
+```
+
+- `get_master_model()` — returns `"qwen"` if Claude disabled or no API key, else `_config["master_model"]`
+- `is_claude_available()` — True only when enabled + key present
+- `_master_json_call(system, prompt)` — routes to Claude API or Ollama based on master
+- `stream_master(history, system_prompt)` — streams from master model
+- Toggle via `POST /settings/master` with `{"model": "qwen", "claude_enabled": false}`
+
+### Skills System
+
+`skills/*.md` files inject domain knowledge into worker system prompts when task keywords match.
+
+**Skill file format** (`skills/my-skill.md`):
+```markdown
+---
+name: My Skill
+description: One-line description
+keywords: keyword1, keyword2, keyword3
+---
+
+## Skill content injected into system prompt...
+```
+
+Available skills: `ssh-operations`, `web-development`, `game-development`, `api-development`, `database`, `debugging`, `system-admin`, `data-visualization`, `mobile-responsive`, `performance-optimization`, `python-scripting`
+
+Skills are loaded by `_load_skills(task_context)` and appended to `_build_worker_system()`. New skills are picked up automatically — no code changes needed.
+
+### AI Model Routing
+
+| Model | Default Role | When Used |
+|-------|-------------|-----------|
+| Claude (`claude-sonnet-4-6`) | Master orchestrator | Planning, eval, review, classification — when `claude_enabled=True` and key present |
+| Qwen (`qwen3.5:9b` via Ollama) | Backup master + worker | All orchestration when Claude offline; reasoning/analysis tasks |
+| DeepSeek (`deepseek-coder-v2` via Ollama) | Coding worker | File implementation tasks |
+
+### Data Storage
 
 ```
 chat.db                          — SQLite: chat history, projects, tasks
@@ -60,45 +109,46 @@ projects/<slug>/devlog.md        — Per-project build log
 projects/<slug>/.git/            — Auto-initialized git repo per project
 memory/universal_lessons.md      — Lessons extracted across all projects
 memory/<slug>/lessons.md         — Per-project lessons from bug-fix runs
+skills/*.md                      — Skill knowledge base files
 ```
 
-### AI model routing
+### Orchestration Flow
 
-- **Claude** (Anthropic API) — orchestration, planning, evaluation, code review, lesson extraction
-- **DeepSeek** (`deepseek-coder-v2:16b-lite-instruct-q5_K_S` via Ollama) — coding tasks
-- **Qwen** (`qwen3.5:9b` via Ollama) — reasoning/analysis tasks
-- Ollama runs locally at `http://localhost:11434`
-
-### Orchestration flow
-
-When the user submits a project-build request via WebSocket:
-1. **Planning** — Claude breaks goal into atomic tasks (JSON list)
-2. **Execution** — Each task dispatched to Claude/DeepSeek/Qwen; responses parsed for `FILE:` blocks and committed to git
-3. **Evaluation** — Claude checks task output for completeness
-4. **Testing** — Claude reviews full project; bugs trigger auto-fix retries
-5. **Completion** — Summary sent, final git commit, devlog updated
+1. **Planning** — `claude_plan_project()` via master model → JSON task list (up to 100 tasks)
+2. **Execution** — `_execute_task()` per task; skills auto-injected; files extracted + git committed
+3. **Evaluation** — `claude_evaluate_task()` via master model; one retry if rejected
+4. **Testing** — `run_test_phase()` via master model; auto-fix if bugs found
+5. **Completion** — `claude_project_summary()` via master model; final git commit
 
 ## Key Constraints (from `AGENT_RULES.md`)
 
-These apply to ALL code written for projects generated by this platform:
-
-- **Port 8080 is reserved** — never start project servers on any port; projects are served via `/play/<slug>/`
+- **Port 8080 reserved** — never start project servers on any port; projects served via `/play/<slug>/`
 - **Relative asset paths only** — `src="js/game.js"` not `src="/js/game.js"`
 - **No local file access** — Mac Mini is headless; no Finder/Explorer/GUI references
 - **`index.html` is the entry point** for every web project
 - **Complete code only** — no stubs, TODOs, or placeholder comments
 - **Canvas/game projects must include touch controls** (`@media (pointer: coarse)`)
-- All HTML must include full `<!DOCTYPE html>` boilerplate with viewport meta
+
+## REST API Quick Reference
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/settings/master` | Get current master model config |
+| POST | `/settings/master` | Toggle master model: `{"model":"qwen","claude_enabled":false}` |
+| GET | `/skills` | List all available skill files |
+| POST | `/settings/apikey` | Update Claude API key |
+| GET | `/status` | Claude API connectivity check |
 
 ## Environment Variables
 
 | Variable | Purpose |
 |----------|---------|
-| `ANTHROPIC_API_KEY` | Required — Claude API access |
-| `SERVER_HOST` | Optional — defaults to `192.168.0.130:8080`; used in agent prompts and play URLs |
+| `ANTHROPIC_API_KEY` | Required for Claude — without it, Qwen becomes master automatically |
+| `SERVER_HOST` | Optional — defaults to `192.168.0.130:8080` |
 
 ## Deployment Context
 
 - **Target machine**: Mac Mini, Apple Silicon, 16GB RAM, macOS, headless
 - **Access**: SSH from Windows laptop at 192.168.0.67 or browser at http://192.168.0.130:8080
 - **Code sync**: Claude Code on Windows Dropbox syncs to Mac Mini via SCP (see `.claude/settings.local.json`)
+- **Ollama**: Must be running on Mac Mini for DeepSeek/Qwen; server degrades gracefully if down

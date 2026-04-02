@@ -62,10 +62,31 @@ AGENT_LABEL = {
     "user":     "Paras",
 }
 
+# ── Runtime config (mutable via API) ─────────────────────────────────────────
+# master_model  : "claude" | "qwen" — who orchestrates, plans, evaluates, classifies
+# claude_enabled: False forces Claude offline without removing the API key
+_config: dict = {
+    "master_model":   "claude",
+    "claude_enabled": True,
+}
+
+
+def get_master_model() -> str:
+    """Return the active master/orchestrator model key ('claude' or 'qwen')."""
+    if not _config["claude_enabled"] or not os.getenv("ANTHROPIC_API_KEY", ""):
+        return "qwen"
+    return _config["master_model"]
+
+
+def is_claude_available() -> bool:
+    """True only when Claude is enabled and an API key is present."""
+    return _config["claude_enabled"] and bool(os.getenv("ANTHROPIC_API_KEY", ""))
+
+
 SYSTEM_PROMPTS = {
     "claude": (
         "You are Claude, an AI assistant in a collaborative group chat. "
-        "Other AI participants: DeepSeek (coding specialist), Qwen (reasoning specialist). "
+        "Other AI participants: DeepSeek (coding specialist), Qwen (reasoning/orchestrator backup). "
         "User is Paras, an indie founder building software products. "
         "Plan, coordinate, and respond concisely. Delegate coding to DeepSeek when appropriate."
     ),
@@ -76,10 +97,11 @@ SYSTEM_PROMPTS = {
         "Write clean, production-quality code. Build on previous context. Be concise."
     ),
     "qwen": (
-        "You are Qwen, a reasoning and analysis specialist in a group chat. "
-        "Other participants: Claude (orchestrator), DeepSeek (coding). "
-        "User is Paras, an indie founder. "
-        "Focus on logical analysis, planning, and problem decomposition. Be concise."
+        "You are Qwen, an AI assistant capable of acting as orchestrator, planner, code reviewer, "
+        "and reasoning specialist. When orchestrating, break tasks into atomic steps, assign them "
+        "to the right agents, and evaluate results. Always output valid JSON when asked for "
+        "structured data. Other participants: Claude (when available), DeepSeek (coding). "
+        "User is Paras, an indie founder. Be concise and precise."
     ),
 }
 
@@ -182,33 +204,23 @@ def append_lesson(project: dict, lesson: str, universal: bool = False) -> None:
 
 
 async def extract_and_save_lesson(project: dict, feedback: str, fix_summary: str) -> str | None:
-    """Ask Claude to distill a reusable lesson from a bug fix. Returns lesson text."""
-    key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        return None
+    """Distill a reusable lesson from a bug fix using the master model."""
+    system = (
+        "You extract concise coding lessons from bug fixes. "
+        "Respond with ONLY the lesson (max 20 words), starting with a verb. "
+        "Example: 'Always initialize canvas game loop with requestAnimationFrame, not setInterval.'"
+    )
     prompt = (
         f"A bug was fixed in project '{project['name']}'.\n"
         f"User feedback: {feedback}\n"
         f"What was fixed: {fix_summary[:500]}\n\n"
-        f"Write ONE concise lesson (max 20 words) that would help avoid this bug in future projects. "
-        f"Start with a verb. Example: 'Always initialize canvas game loop with requestAnimationFrame, not setInterval.' "
+        f"Write ONE concise lesson (max 20 words) to avoid this bug in future projects. "
         f"Respond with ONLY the lesson, nothing else."
     )
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-6", "max_tokens": 60,
-                      "messages": [{"role": "user", "content": prompt}]},
-            )
-        if r.status_code != 200:
-            return None
-        lesson = r.json().get("content", [{}])[0].get("text", "").strip()
+        lesson = await _master_json_call(system, prompt, max_tokens=80)
         if not lesson:
             return None
-        # Every 3rd project lesson also goes universal
         count = _count_project_lessons(project)
         universal = (count % 3 == 0)
         append_lesson(project, lesson, universal=universal)
@@ -747,19 +759,21 @@ async def check_claude_online() -> bool:
 
 def parse_mentions(msg: str, claude_online: bool) -> list[str]:
     lo = msg.lower()
+    claude_usable = claude_online and is_claude_available()
+
     if "@all" in lo:
         base = ["qwen", "deepseek"]
-        return (["claude"] + base) if claude_online else base
+        return (["claude"] + base) if claude_usable else base
 
     targets: list[str] = []
-    if "@claude" in lo and claude_online:
+    if "@claude" in lo and claude_usable:
         targets.append("claude")
     if "@deepseek" in lo:
         targets.append("deepseek")
     if "@qwen" in lo:
         targets.append("qwen")
 
-    return targets or (["claude"] if claude_online else ["qwen"])
+    return targets or ([get_master_model()] if (get_master_model() != "claude" or claude_usable) else ["qwen"])
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
 
@@ -875,27 +889,118 @@ async def stream_ollama(agent: str, history: list[dict], system_prompt: str | No
     except Exception as e:
         yield f"\n\n*[Ollama error: {e}]*"
 
+
+# ── Ollama structured (non-streaming) call ────────────────────────────────────
+
+async def _ollama_json_call(agent: str, system: str, prompt: str, max_tokens: int = 2048) -> str:
+    """Non-streaming Ollama call for structured output (planning, classification, evaluation)."""
+    model = OLLAMA_MODELS.get(agent, OLLAMA_MODELS["qwen"])
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(
+                f"{OLLAMA_BASE}/api/chat",
+                json={
+                    "model":    model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    "stream":     False,
+                    "keep_alive": KEEP_ALIVE,
+                    "options":    {"num_predict": max_tokens},
+                },
+            )
+        if r.status_code != 200:
+            logging.warning("_ollama_json_call HTTP %d for %s", r.status_code, agent)
+            return ""
+        text = r.json().get("message", {}).get("content", "").strip()
+        # Strip <think>…</think> from reasoning models
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        return text
+    except Exception as e:
+        logging.warning("_ollama_json_call(%s) error: %s", agent, e)
+        return ""
+
+
+async def _master_json_call(system: str, prompt: str, max_tokens: int = 512) -> str:
+    """Route a structured JSON call to the active master model (Claude or Qwen)."""
+    if get_master_model() == "claude":
+        key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not key:
+            return ""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                             "content-type": "application/json"},
+                    json={"model": "claude-sonnet-4-6", "max_tokens": max_tokens,
+                          "system": system,
+                          "messages": [{"role": "user", "content": prompt}]},
+                )
+            if r.status_code != 200:
+                logging.warning("_master_json_call(claude) HTTP %d", r.status_code)
+                return ""
+            return r.json().get("content", [{}])[0].get("text", "").strip()
+        except Exception as e:
+            logging.warning("_master_json_call(claude) error: %s", e)
+            return ""
+    else:
+        return await _ollama_json_call("qwen", system, prompt, max_tokens)
+
+
+async def stream_master(history: list[dict], system_prompt: str | None = None,
+                        cancel_event: asyncio.Event | None = None,
+                        usage: dict | None = None):
+    """Stream from the active master model (Claude or Qwen)."""
+    if get_master_model() == "claude" and is_claude_available():
+        async for chunk in stream_claude(history, system_prompt, cancel_event, usage):
+            yield chunk
+    else:
+        async for chunk in stream_ollama("qwen", history, system_prompt, cancel_event, usage):
+            yield chunk
+
+
+# ── Skills system ─────────────────────────────────────────────────────────────
+
+SKILLS_DIR = Path(__file__).parent / "skills"
+
+
+def _load_skills(context: str) -> str:
+    """Load skill content whose keywords match the given context string.
+
+    Each skill file (skills/*.md) must have frontmatter with a 'keywords' line:
+        keywords: ssh, remote, terminal, shell
+    Matched skill bodies are appended to system prompts.
+    """
+    if not SKILLS_DIR.exists():
+        return ""
+    matched: list[str] = []
+    ctx_lower = context.lower()
+    for skill_file in sorted(SKILLS_DIR.glob("*.md")):
+        try:
+            raw = skill_file.read_text(encoding="utf-8")
+            kw_match = re.search(r"^keywords:\s*(.+)$", raw, re.MULTILINE)
+            if not kw_match:
+                continue
+            keywords = [k.strip() for k in kw_match.group(1).split(",") if k.strip()]
+            if any(kw in ctx_lower for kw in keywords):
+                # Strip YAML frontmatter (--- ... ---) and return the body
+                body = re.sub(r"^---.*?---\s*", "", raw, flags=re.DOTALL).strip()
+                if body:
+                    matched.append(body)
+        except Exception:
+            pass
+    if not matched:
+        return ""
+    return "\n\n---\nACTIVE SKILLS:\n" + "\n\n".join(matched)
+
+
 # ── Intent detection ──────────────────────────────────────────────────────────
 
 async def _claude_classify(system: str, message: str, max_tokens: int = 30) -> str:
-    """Shared low-cost Claude call for intent classification."""
-    key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-6", "max_tokens": max_tokens, "system": system,
-                      "messages": [{"role": "user", "content": message}]},
-            )
-        if r.status_code != 200:
-            return ""
-        return r.json().get("content", [{}])[0].get("text", "").strip()
-    except Exception as e:
-        logging.warning("_claude_classify error: %s", e)
-        return ""
+    """Intent classification routed through the active master model."""
+    return await _master_json_call(system, message, max_tokens)
 
 
 async def detect_intent(message: str) -> dict:
@@ -970,28 +1075,25 @@ async def stream_project_query(ws: WebSocket, project_id: int, question: str,
     )
     history = [{"role": "user", "content": f"{context}\n\nQuestion: {question}"}]
 
+    master = get_master_model()
     save_project_message(project_id, "user", question)
     await ws.send_json({"type": "user", "content": question, "timestamp": datetime.utcnow().isoformat()})
     await ws.send_json({"type": "agent_count", "count": 1})
-    await ws.send_json({"type": "typing", "agent": "claude"})
+    await ws.send_json({"type": "typing", "agent": master})
 
     full = ""
-    async for chunk in stream_claude(history, system_prompt=system, cancel_event=cancel_event):
-        await ws.send_json({"type": "chunk", "agent": "claude", "content": chunk})
+    async for chunk in stream_master(history, system_prompt=system, cancel_event=cancel_event):
+        await ws.send_json({"type": "chunk", "agent": master, "content": chunk})
         full += chunk
 
-    await ws.send_json({"type": "done", "agent": "claude"})
+    await ws.send_json({"type": "done", "agent": master})
     if full.strip():
-        save_project_message(project_id, "claude", full.strip())
+        save_project_message(project_id, master, full.strip())
 
 # ── Claude structured calls ──────────────────────────────────────────────────
 
 async def claude_plan_project(project: dict, goal: str) -> list[dict]:
-    """Ask Claude to create an atomic task plan. Returns list of task dicts."""
-    key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        return []
-
+    """Create an atomic task plan using the master model. Returns list of task dicts."""
     system = textwrap.dedent(f"""\
         You are a senior software architect planning a project for a multi-agent coding system.
         Your job is to break the goal into ATOMIC, INDEPENDENT tasks that local LLMs can execute
@@ -1002,7 +1104,8 @@ async def claude_plan_project(project: dict, goal: str) -> list[dict]:
                        anything requiring deep reasoning. Use sparingly (costs money).
         - "deepseek" : Individual self-contained files with clear specs. Good at following
                        exact instructions. BAD at cross-file integration.
-        - "qwen"     : Config files, HTML structure, simple CSS, documentation only.
+        - "qwen"     : Config files, HTML structure, simple CSS, documentation, simple utilities.
+                       Also used as orchestrator when Claude is offline.
 
         ATOMIC TASK RULES (critical for quality):
         1. Each task creates EXACTLY ONE file (two files max if tightly coupled, e.g. .html + inline css).
@@ -1014,12 +1117,14 @@ async def claude_plan_project(project: dict, goal: str) -> list[dict]:
            that a different task will create.
         5. Assign to "claude" if: complex game logic, physics, AI, data structures, algorithms.
            Assign to "deepseek" if: clear isolated file with spec (simple CSS, config, utility).
-           Assign to "qwen" only for: plain HTML/CSS structure, README, simple config JSON.
+           Assign to "qwen" for: plain HTML/CSS structure, README, simple config JSON, documentation.
 
         QUALITY RULES:
-        - Max 8 tasks total. Prefer fewer, larger tasks over many tiny ones.
+        - Use as many atomic tasks as the project needs. For simple projects (single-page game/app),
+          1–3 tasks is fine. For complex multi-file projects, use 10–50+ tasks — each one small and clear.
+          Break large tasks down so each local LLM can complete its task without ambiguity.
         - Every task description must specify EXACT element IDs, function names, and API contracts
-          that other files depend on (so deepseek doesn't guess wrong names).
+          that other files depend on (so agents don't guess wrong names).
         - Code must be COMPLETE — no TODOs, no placeholders, no "add logic here" comments.
         - All HTML files: include DOCTYPE, charset UTF-8, viewport meta.
 
@@ -1054,39 +1159,24 @@ async def claude_plan_project(project: dict, goal: str) -> list[dict]:
         f"Description: {project.get('description', '')}\n"
         f"Goal: {goal}\n"
         f"{lessons_block}\n"
-        f"Create the minimal atomic task plan. "
-        f"If this is a simple web game/app, use a single task writing one self-contained index.html."
+        f"Create the atomic task plan. "
+        f"If this is a simple web game/app, use a single task writing one self-contained index.html. "
+        f"For complex projects, use as many tasks as needed — each small and unambiguous."
     )
 
+    text = ""
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 2048,
-                    "system": system,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
-            if r.status_code != 200:
-                logging.error("claude_plan_project HTTP %d: %s", r.status_code, r.text[:200])
-                return []
-            data = r.json()
-            text = data.get("content", [{}])[0].get("text", "").strip()
-            text = re.sub(r'^```(?:json)?\s*', '', text)
-            text = re.sub(r'\s*```$', '', text.strip())
-            tasks = json.loads(text)
-            # Validate and cap
-            if not isinstance(tasks, list):
-                logging.error("claude_plan_project returned non-list: %s", text[:200])
-                return []
-            return tasks[:12]  # hard cap
+        text = await _master_json_call(system, prompt, max_tokens=4096)
+        if not text:
+            logging.error("claude_plan_project: master model returned empty response")
+            return []
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text.strip())
+        tasks = json.loads(text)
+        if not isinstance(tasks, list):
+            logging.error("claude_plan_project returned non-list: %s", text[:200])
+            return []
+        return tasks[:100]  # cap at 100 atomic tasks
     except json.JSONDecodeError as e:
         logging.error("claude_plan_project JSON parse error: %s — raw: %s", e, text[:300])
         return []
@@ -1096,59 +1186,34 @@ async def claude_plan_project(project: dict, goal: str) -> list[dict]:
 
 
 async def claude_evaluate_task(project: dict, task: dict, output: str) -> dict:
-    """Claude reviews if task output meets requirements."""
-    key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        return {"approved": True, "feedback": ""}
-
+    """Evaluate if a task was completed correctly using the master model."""
     system = textwrap.dedent("""\
         You evaluate if a coding task was completed correctly.
         Respond ONLY with JSON: {"approved": true/false, "feedback": "brief feedback if not approved"}
         Be lenient — approve if the code is reasonable and addresses the task.
     """)
-
     prompt = (
         f"Task: {task['title']}\n"
         f"Description: {task['description']}\n"
         f"Files expected: {json.dumps(task.get('files_to_create', []))}\n\n"
         f"Agent output:\n{output[:3000]}"
     )
-
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 200,
-                    "system": system,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
-            if r.status_code != 200:
-                return {"approved": True, "feedback": ""}
-            data = r.json()
-            text = data.get("content", [{}])[0].get("text", "").strip()
-            text = re.sub(r'^```(?:json)?\s*', '', text)
-            text = re.sub(r'\s*```$', '', text)
-            return json.loads(text)
+        text = await _master_json_call(system, prompt, max_tokens=200)
+        if not text:
+            return {"approved": True, "feedback": ""}
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+        return json.loads(text)
     except Exception:
         return {"approved": True, "feedback": ""}
 
 
 async def claude_project_summary(project: dict, goal: str, tasks: list) -> str:
-    """Claude writes a summary paragraph about what was built."""
-    key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        return f"Project '{project['name']}' completed with {len(tasks)} tasks."
-
+    """Write a project completion summary using the master model."""
     task_desc = "\n".join(f"- Task {t['task_number']}: {t['title']} ({t['status']})" for t in tasks)
     slug = project.get("slug", "project")
+    system = "You write concise project summaries for a developer. Be direct and helpful."
     prompt = (
         f"Project: {project['name']}\n"
         f"Goal: {goal}\n\n"
@@ -1157,28 +1222,8 @@ async def claude_project_summary(project: dict, goal: str, tasks: list) -> str:
         f"IMPORTANT: Always end your summary with this exact line:\n"
         f"To play/test: open http://{SERVER_HOST}/play/{slug}/ in your browser"
     )
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 500,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
-            if r.status_code != 200:
-                return f"Project '{project['name']}' completed with {len(tasks)} tasks."
-            data = r.json()
-            return data.get("content", [{}])[0].get("text", "").strip()
-    except Exception:
-        return f"Project '{project['name']}' completed with {len(tasks)} tasks."
+    summary = await _master_json_call(system, prompt, max_tokens=500)
+    return summary or f"Project '{project['name']}' completed with {len(tasks)} tasks.\nTo play/test: open http://{SERVER_HOST}/play/{slug}/ in your browser"
 
 # ── Orchestration loop ────────────────────────────────────────────────────────
 
@@ -1333,7 +1378,7 @@ async def _execute_task(ws: WebSocket, project: dict, task: dict, goal: str,
                     file_context += "\n[...truncated for brevity...]\n"
                     break
 
-    worker_system = _build_worker_system(project)
+    worker_system = _build_worker_system(project, task_context=task["description"])
 
     worker_prompt = (
         f"Task {tnum}: {task['title']}\n\n"
@@ -1435,9 +1480,10 @@ async def _execute_task(ws: WebSocket, project: dict, task: dict, goal: str,
     await ws.send_json({"type": "orch_task_done", "task_id": tid, "files": written})
 
 
-def _build_worker_system(project: dict) -> str:
-    """Shared system prompt for all worker agents."""
+def _build_worker_system(project: dict, task_context: str = "") -> str:
+    """Shared system prompt for all worker agents, with optional skill injection."""
     slug = project.get("slug", "project")
+    skills_block = _load_skills(task_context) if task_context else ""
     return textwrap.dedent(f"""\
         You are implementing a specific task for project '{project['name']}'.
         Write clean, production-quality code. Output ONLY file content — no explanations, no preamble.
@@ -1463,12 +1509,11 @@ def _build_worker_system(project: dict) -> str:
         - Headless Mac Mini. No display, no GUI. Users access via browser.
         - Project URL: http://{SERVER_HOST}/play/{slug}/
         - Asset paths MUST be relative (e.g. 'js/game.js' not '/js/game.js').
-    """).strip()
+    """).strip() + skills_block
 
 
 async def run_test_phase(ws: WebSocket, project: dict, cancel_event: asyncio.Event | None = None) -> None:
-    """Claude reviews all project files for concrete bugs; Claude fixes them if found."""
-    key = os.getenv("ANTHROPIC_API_KEY", "")
+    """Review all project files for concrete bugs using master model; fixes them if found."""
     files = read_project_files(project)
     if not files:
         return
@@ -1511,38 +1556,13 @@ async def run_test_phase(ws: WebSocket, project: dict, cancel_event: asyncio.Eve
 
     review_prompt = f"Review this project for the bugs listed:\n\n{file_context}"
 
-    if key:
-        # Use Claude for reliable code review
-        try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                r = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                             "content-type": "application/json"},
-                    json={"model": "claude-sonnet-4-6", "max_tokens": 1024,
-                          "system": test_system,
-                          "messages": [{"role": "user", "content": review_prompt}]},
-                )
-            test_output = r.json().get("content", [{}])[0].get("text", "").strip() if r.status_code == 200 else ""
-        except Exception as e:
-            logging.warning("test_phase claude error: %s", e)
-            test_output = ""
-        if test_output:
-            await ws.send_json({"type": "chunk", "agent": "claude", "content": test_output})
-            await ws.send_json({"type": "done", "agent": "claude"})
-            save_project_message(project["id"], "claude", test_output)
-    else:
-        # Fallback to qwen
-        await ws.send_json({"type": "typing", "agent": "qwen"})
-        test_output = ""
-        async for chunk in stream_ollama("qwen", [{"role": "user", "content": review_prompt}],
-                                         system_prompt=test_system, cancel_event=cancel_event):
-            if cancel_event and cancel_event.is_set():
-                return
-            await ws.send_json({"type": "chunk", "agent": "qwen", "content": chunk})
-            test_output += chunk
-        await ws.send_json({"type": "done", "agent": "qwen"})
-        save_project_message(project["id"], "qwen", test_output.strip())
+    master = get_master_model()
+    await ws.send_json({"type": "typing", "agent": master})
+    test_output = await _master_json_call(test_system, review_prompt, max_tokens=1024)
+    if test_output:
+        await ws.send_json({"type": "chunk", "agent": master, "content": test_output})
+        await ws.send_json({"type": "done", "agent": master})
+        save_project_message(project["id"], master, test_output)
 
     if not test_output:
         return
@@ -1565,26 +1585,17 @@ async def run_test_phase(ws: WebSocket, project: dict, cancel_event: asyncio.Eve
         f"Output the complete corrected file content(s) using FILE: markers on the first line."
     )
 
-    await ws.send_json({"type": "typing", "agent": "claude" if key else "deepseek"})
+    await ws.send_json({"type": "typing", "agent": master})
     fix_output = ""
-    if key:
-        async for chunk in stream_claude([{"role": "user", "content": fix_prompt}],
-                                         system_prompt=fix_system, cancel_event=cancel_event):
-            if cancel_event and cancel_event.is_set():
-                return
-            await ws.send_json({"type": "chunk", "agent": "claude", "content": chunk})
-            fix_output += chunk
-        await ws.send_json({"type": "done", "agent": "claude"})
-    else:
-        async for chunk in stream_ollama("deepseek", [{"role": "user", "content": fix_prompt}],
-                                          system_prompt=fix_system, cancel_event=cancel_event):
-            if cancel_event and cancel_event.is_set():
-                return
-            await ws.send_json({"type": "chunk", "agent": "deepseek", "content": chunk})
-            fix_output += chunk
-        await ws.send_json({"type": "done", "agent": "deepseek"})
+    async for chunk in stream_master([{"role": "user", "content": fix_prompt}],
+                                      system_prompt=fix_system, cancel_event=cancel_event):
+        if cancel_event and cancel_event.is_set():
+            return
+        await ws.send_json({"type": "chunk", "agent": master, "content": chunk})
+        fix_output += chunk
+    await ws.send_json({"type": "done", "agent": master})
 
-    save_project_message(project["id"], "claude" if key else "deepseek", fix_output.strip())
+    save_project_message(project["id"], master, fix_output.strip())
     fixed = write_project_files(project, extract_files_from_response(fix_output))
     for fp in fixed:
         await ws.send_json({"type": "orch_file", "path": fp})
@@ -1602,7 +1613,6 @@ async def run_fix_task(ws: WebSocket, project_id: int, feedback: str,
     if not project:
         return
 
-    key = os.getenv("ANTHROPIC_API_KEY", "")
     files = read_project_files(project)
 
     # Build file context, capped to avoid huge prompts
@@ -1615,7 +1625,7 @@ async def run_fix_task(ws: WebSocket, project_id: int, feedback: str,
             break
     file_context = "\n\n".join(context_parts)
 
-    fix_system = _build_worker_system(project)
+    fix_system = _build_worker_system(project, task_context=feedback)
     fix_prompt = (
         f"User feedback / request:\n{feedback}\n\n"
         f"Current project files:\n{file_context}\n\n"
@@ -1631,25 +1641,16 @@ async def run_fix_task(ws: WebSocket, project_id: int, feedback: str,
     fix_stats = OrchStats()
     full = ""
     tok: dict = {}
-    agent_used = "claude" if key else "deepseek"
+    agent_used = get_master_model()
     await ws.send_json({"type": "typing", "agent": agent_used})
 
-    if key:
-        async for chunk in stream_claude([{"role": "user", "content": fix_prompt}],
-                                          system_prompt=fix_system, cancel_event=cancel_event, usage=tok):
-            if cancel_event and cancel_event.is_set():
-                await ws.send_json({"type": "cancelled"})
-                return
-            await ws.send_json({"type": "chunk", "agent": "claude", "content": chunk})
-            full += chunk
-    else:
-        async for chunk in stream_ollama("deepseek", [{"role": "user", "content": fix_prompt}],
-                                          system_prompt=fix_system, cancel_event=cancel_event, usage=tok):
-            if cancel_event and cancel_event.is_set():
-                await ws.send_json({"type": "cancelled"})
-                return
-            await ws.send_json({"type": "chunk", "agent": "deepseek", "content": chunk})
-            full += chunk
+    async for chunk in stream_master([{"role": "user", "content": fix_prompt}],
+                                      system_prompt=fix_system, cancel_event=cancel_event, usage=tok):
+        if cancel_event and cancel_event.is_set():
+            await ws.send_json({"type": "cancelled"})
+            return
+        await ws.send_json({"type": "chunk", "agent": agent_used, "content": chunk})
+        full += chunk
 
     await ws.send_json({"type": "done", "agent": agent_used})
     fix_stats.record(agent_used,
@@ -1949,6 +1950,65 @@ async def api_delete_project(project_id: int):
         c.execute("DELETE FROM projects WHERE id = ?", (project_id,))
 
     return {"ok": True}
+
+
+# ── Master model settings ────────────────────────────────────────────────────
+
+@app.get("/settings/master")
+async def get_master_settings():
+    """Return current master model config and effective master."""
+    return {
+        "master_model":    _config["master_model"],
+        "claude_enabled":  _config["claude_enabled"],
+        "effective_master": get_master_model(),
+    }
+
+
+@app.post("/settings/master")
+async def set_master_settings(data: dict):
+    """Toggle master model (claude/qwen) and claude_enabled flag.
+
+    Body: {"model": "claude"|"qwen", "claude_enabled": true|false}
+    Either field is optional.
+    """
+    if "model" in data and data["model"] in ("claude", "qwen"):
+        _config["master_model"] = data["model"]
+    if "claude_enabled" in data:
+        _config["claude_enabled"] = bool(data["claude_enabled"])
+    logging.info(
+        "Master model updated → master=%s claude_enabled=%s effective=%s",
+        _config["master_model"], _config["claude_enabled"], get_master_model()
+    )
+    return {
+        "master_model":    _config["master_model"],
+        "claude_enabled":  _config["claude_enabled"],
+        "effective_master": get_master_model(),
+    }
+
+
+# ── Skills ────────────────────────────────────────────────────────────────────
+
+@app.get("/skills")
+async def list_skills():
+    """List all available skill files with their metadata."""
+    if not SKILLS_DIR.exists():
+        return []
+    skills = []
+    for sf in sorted(SKILLS_DIR.glob("*.md")):
+        try:
+            raw = sf.read_text(encoding="utf-8")
+            name_m = re.search(r"^name:\s*(.+)$", raw, re.MULTILINE)
+            kw_m   = re.search(r"^keywords:\s*(.+)$", raw, re.MULTILINE)
+            desc_m = re.search(r"^description:\s*(.+)$", raw, re.MULTILINE)
+            skills.append({
+                "file":        sf.name,
+                "name":        name_m.group(1).strip() if name_m else sf.stem,
+                "description": desc_m.group(1).strip() if desc_m else "",
+                "keywords":    [k.strip() for k in kw_m.group(1).split(",")] if kw_m else [],
+            })
+        except Exception:
+            pass
+    return skills
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
