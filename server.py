@@ -779,7 +779,8 @@ def parse_mentions(msg: str, claude_online: bool) -> list[str]:
 
 async def stream_claude(history: list[dict], system_prompt: str | None = None,
                         cancel_event: asyncio.Event | None = None,
-                        usage: dict | None = None):
+                        usage: dict | None = None,
+                        max_tokens: int = 4096):
     """Stream Claude response; populates usage['input_tokens'] and usage['output_tokens'] if provided."""
     key  = os.getenv("ANTHROPIC_API_KEY", "")
     msgs = build_claude_messages(history)
@@ -798,7 +799,7 @@ async def stream_claude(history: list[dict], system_prompt: str | None = None,
                 },
                 json={
                     "model": "claude-sonnet-4-6",
-                    "max_tokens": 4096,
+                    "max_tokens": max_tokens,
                     "system": sys_prompt,
                     "messages": msgs,
                     "stream": True,
@@ -951,10 +952,11 @@ async def _master_json_call(system: str, prompt: str, max_tokens: int = 512) -> 
 
 async def stream_master(history: list[dict], system_prompt: str | None = None,
                         cancel_event: asyncio.Event | None = None,
-                        usage: dict | None = None):
+                        usage: dict | None = None,
+                        max_tokens: int = 4096):
     """Stream from the active master model (Claude or Qwen)."""
     if get_master_model() == "claude" and is_claude_available():
-        async for chunk in stream_claude(history, system_prompt, cancel_event, usage):
+        async for chunk in stream_claude(history, system_prompt, cancel_event, usage, max_tokens):
             yield chunk
     else:
         async for chunk in stream_ollama("qwen", history, system_prompt, cancel_event, usage):
@@ -1099,34 +1101,37 @@ async def claude_plan_project(project: dict, goal: str) -> list[dict]:
         Your job is to break the goal into ATOMIC, INDEPENDENT tasks that local LLMs can execute
         reliably without making integration mistakes.
 
-        AGENT CAPABILITIES:
-        - "claude"   : Complex logic, algorithms, full game engines, integration glue code,
-                       anything requiring deep reasoning. Use sparingly (costs money).
-        - "deepseek" : Individual self-contained files with clear specs. Good at following
-                       exact instructions. BAD at cross-file integration.
-        - "qwen"     : Config files, HTML structure, simple CSS, documentation, simple utilities.
-                       Also used as orchestrator when Claude is offline.
+        AGENT ROLES — READ CAREFULLY:
+        - "deepseek" : PRIMARY CODER. Handles ALL code implementation — HTML, CSS, JS, Python,
+                       games, web apps, APIs, scripts. DeepSeek writes every file that contains code.
+                       Give it a precise spec and it will produce complete, working code.
+        - "qwen"     : SECONDARY. Config JSON, README.md, plain HTML shells (no JS), pure CSS files,
+                       documentation. Never assign JS game logic or complex code to qwen.
+        - "claude"   : DO NOT USE as a worker. Claude is the planner/orchestrator — not a coder.
+                       NEVER set assigned_to="claude" in your output. If you're tempted to, use
+                       "deepseek" instead. Claude writing code = expensive + truncated output.
 
         ATOMIC TASK RULES (critical for quality):
-        1. Each task creates EXACTLY ONE file (two files max if tightly coupled, e.g. .html + inline css).
+        1. Each task produces at most ONE file, max ~250 lines of output.
+           If a file will be longer, split it: e.g. game-engine.js + game-ui.js.
         2. Tasks must be INDEPENDENT — no task should import/require code from another task's output.
-           If file B needs code from file A, assign both to the SAME task or use window.globals instead of ES imports.
-        3. For web projects under ~600 lines: prefer ONE self-contained index.html with ALL CSS and JS inline.
-           Only split into multiple files if the project is genuinely large and complex.
-        4. The agent writing index.html must also write ALL script/style tags — never reference files
-           that a different task will create.
-        5. Assign to "claude" if: complex game logic, physics, AI, data structures, algorithms.
-           Assign to "deepseek" if: clear isolated file with spec (simple CSS, config, utility).
-           Assign to "qwen" for: plain HTML/CSS structure, README, simple config JSON, documentation.
+           Use window.globals instead of ES imports across files.
+        3. The agent writing index.html must include ALL <script> and <link> tags for files other
+           tasks will create — reference them by their relative paths.
+        4. For a game or interactive app, always split into at least these tasks:
+           a) index.html + CSS (deepseek) — full markup, styles, canvas, touch buttons
+           b) game constants + data (deepseek) — shapes, colors, scoring tables
+           c) game logic / mechanics (deepseek) — board state, collision, line clearing
+           d) rendering (deepseek) — all draw functions
+           e) input handling + game loop (deepseek) — keyboard, touch, requestAnimationFrame
+        5. Each task description must specify EXACT element IDs, function names, and window.globals
+           so deepseek doesn't guess wrong names between files.
 
         QUALITY RULES:
-        - Use as many atomic tasks as the project needs. For simple projects (single-page game/app),
-          1–3 tasks is fine. For complex multi-file projects, use 10–50+ tasks — each one small and clear.
-          Break large tasks down so each local LLM can complete its task without ambiguity.
-        - Every task description must specify EXACT element IDs, function names, and API contracts
-          that other files depend on (so agents don't guess wrong names).
+        - A 400-line Tetris written in 6 focused tasks beats a 1000-line single task that truncates.
         - Code must be COMPLETE — no TODOs, no placeholders, no "add logic here" comments.
         - All HTML files: include DOCTYPE, charset UTF-8, viewport meta.
+        - Games must support both keyboard AND touch controls.
 
         ENVIRONMENT:
         - Headless Mac Mini, no display. Projects served at http://{SERVER_HOST}/play/<slug>/
@@ -1392,11 +1397,11 @@ async def _execute_task(ws: WebSocket, project: dict, task: dict, goal: str,
     # d. Typing indicator
     await ws.send_json({"type": "typing", "agent": agent})
 
-    # e. Stream response
+    # e. Stream response — use 8192 tokens for worker code generation tasks
     full = ""
     tok: dict = {}
     if agent == "claude":
-        gen = stream_claude(history, system_prompt=worker_system, cancel_event=cancel_event, usage=tok)
+        gen = stream_claude(history, system_prompt=worker_system, cancel_event=cancel_event, usage=tok, max_tokens=8192)
     else:
         gen = stream_ollama(agent, history, system_prompt=worker_system, cancel_event=cancel_event, usage=tok)
 
