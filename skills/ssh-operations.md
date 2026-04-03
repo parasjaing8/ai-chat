@@ -7,7 +7,7 @@ keywords: ssh, remote, mac mini, sbc, raspberry pi, terminal, shell, command, ex
 ## SSH Operations Skill
 
 ### Target Hosts
-- **Mac Mini**: `ssh parasjain@192.168.0.130`
+- **Mac Mini**: `ssh parasjain@<MAC_MINI_IP>` (default: `192.168.0.130`)
 - **Default user**: `parasjain`
 - **Working dir**: `/Users/parasjain/ai-chat/`
 
@@ -42,9 +42,9 @@ ssh parasjain@192.168.0.130 "ps aux | grep 'process_name' | grep -v grep"
 ssh parasjain@192.168.0.130 "kill \$(ps aux | grep 'uvicorn server:app' | grep -v grep | awk '{print \$2}') 2>/dev/null; nohup /Users/parasjain/ai-chat/.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8080 > /tmp/ai-chat.log 2>&1 &"
 ```
 
-**Tail server logs:**
+**Tail server logs** (log file rotates at 10 MB, 3 backups kept beside `server.py`):
 ```bash
-ssh parasjain@192.168.0.130 "tail -f /tmp/ai-chat.log"
+ssh parasjain@192.168.0.130 "tail -f /Users/parasjain/ai-chat/ai-chat.log"
 ```
 
 ### Rules

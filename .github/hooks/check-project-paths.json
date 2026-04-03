@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "windows": "powershell -NoProfile -ExecutionPolicy Bypass -File .github/hooks/scripts/check-project-paths.ps1",
+        "command": "bash .github/hooks/scripts/check-project-paths.sh",
+        "timeout": 10
+      }
+    ]
+  }
+}

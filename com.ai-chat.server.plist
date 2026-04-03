@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent for ai-chat server (auto-start + crash recovery)
+
+  INSTALL:
+    cp com.ai-chat.server.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.ai-chat.server.plist
+
+  USEFUL COMMANDS:
+    launchctl list | grep ai-chat          # check if running (shows PID)
+    launchctl stop  com.ai-chat.server     # graceful stop
+    launchctl start com.ai-chat.server     # manual start
+    launchctl unload ~/Library/LaunchAgents/com.ai-chat.server.plist  # disable
+
+  LOGS:
+    tail -f /Users/parasjain/ai-chat/ai-chat.log      # app log (rotating)
+    tail -f /tmp/ai-chat-launchd.err                  # launchd stderr capture
+-->
+<plist version="1.0">
+<dict>
+  <!-- Unique label — must match filename -->
+  <key>Label</key>
+  <string>com.ai-chat.server</string>
+
+  <!-- Command to run -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/parasjain/ai-chat/.venv/bin/python</string>
+    <string>-m</string>
+    <string>uvicorn</string>
+    <string>server:app</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>8080</string>
+  </array>
+
+  <!-- Working directory -->
+  <key>WorkingDirectory</key>
+  <string>/Users/parasjain/ai-chat</string>
+
+  <!-- Start at login and keep alive (restart on crash) -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Throttle rapid crash-loops: wait 10s before restarting -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- Environment variables -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/parasjain/ai-chat/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <!-- ANTHROPIC_API_KEY is loaded from .env by the server at startup -->
+  </dict>
+
+  <!-- Capture stdout/stderr for debugging launchd issues -->
+  <key>StandardOutPath</key>
+  <string>/tmp/ai-chat-launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/ai-chat-launchd.err</string>
+</dict>
+</plist>

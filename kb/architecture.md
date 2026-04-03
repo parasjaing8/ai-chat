@@ -78,10 +78,10 @@ tasks (id, project_id, task_number, title, description, assigned_to, status, fil
 ## File Extraction
 
 `extract_files_from_response()` parses agent output using 4 patterns:
-1. `FILE: path\n```lang\n...\n````
-2. `## path\n```lang\n...\n````
-3. Named code fences ` ```html:path `
-4. Bare ` ```html ` blocks (assigned to `index.html`)
+1. `FILE:` marker as a comment on the first line **inside** a fenced code block (e.g. `// FILE: js/game.js`)
+2. `FILE:` marker on its own line **before** a fenced code block (DeepSeek style)
+3. `**\`path\`**` or `### \`path\`` heading immediately before a code block
+4. Bare ` ```html ` / ` ```javascript ` blocks (no FILE: marker) — mapped to `index.html` / `js/main.js`
 
 Path sanitization prevents directory traversal. Files written to `projects/<slug>/src/`.
 

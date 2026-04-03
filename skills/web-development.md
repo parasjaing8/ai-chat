@@ -7,7 +7,7 @@ keywords: html, css, javascript, website, webpage, web app, frontend, ui, ux, do
 ## Web Development Skill
 
 ### Platform Context
-Projects are served at `http://192.168.0.130:8080/play/<slug>/`. All files live in `projects/<slug>/src/`.
+Projects are served at `http://{SERVER_HOST}/play/<slug>/` (default: `http://192.168.0.130:8080/play/<slug>/`). All files live in `projects/<slug>/src/`.
 
 ### Required Structure
 Every web project must have `index.html` as the entry point. Always use **relative asset paths**:

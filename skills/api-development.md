@@ -28,7 +28,7 @@ async def create_resource(data: dict):
 
 ### Server Context
 - The server runs on port **8080** (reserved — do not use for other services)
-- All routes already handle CORS via the existing FastAPI setup
+- No CORS middleware is configured — this server is LAN-only; do not add CORSMiddleware unless explicitly requested
 - WebSocket endpoint at `/ws` handles all real-time communication
 - Static files at `/static/`, project files at `/play/<slug>/`
 
