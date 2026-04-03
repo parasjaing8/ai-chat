@@ -30,7 +30,7 @@ scp \
   "$MAC:$REMOTE/"
 
 echo "==> Syncing static files..."
-scp "$LOCAL/static/index.html" "$MAC:$REMOTE/static/index.html"
+scp "$LOCAL/static/index.html" "$LOCAL/static/app.js" "$LOCAL/static/app.css" "$MAC:$REMOTE/static/"
 
 echo "==> Syncing skills..."
 scp "$LOCAL/skills/"*.md "$MAC:$REMOTE/skills/"
