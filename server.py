@@ -63,12 +63,21 @@ AGENT_LABEL = {
 }
 
 # ── Runtime config (mutable via API) ─────────────────────────────────────────
-# master_model  : "claude" | "qwen" — who orchestrates, plans, evaluates, classifies
-# claude_enabled: False forces Claude offline without removing the API key
+# master_model    : "claude" | "qwen" — who orchestrates, plans, evaluates, classifies
+# claude_enabled  : False forces Claude offline without removing the API key
+# disabled_agents : list of agent names manually disabled by the user
 _config: dict = {
-    "master_model":   "claude",
-    "claude_enabled": True,
+    "master_model":    "claude",
+    "claude_enabled":  True,
+    "disabled_agents": [],
 }
+
+
+def get_enabled_agents() -> list[str]:
+    """Return the list of agents that are currently enabled."""
+    disabled = set(_config.get("disabled_agents", []))
+    all_agents = ["claude", "deepseek", "qwen"]
+    return [a for a in all_agents if a not in disabled]
 
 
 def get_master_model() -> str:
@@ -577,6 +586,24 @@ def extract_files_from_response(content: str) -> list[dict]:
                 seen.add(filename)
                 files.append({"filename": filename, "content": code})
 
+    if files:
+        return files
+
+    # ── Fallback: bare ```html / ```javascript block — no FILE: marker ────────
+    # DeepSeek sometimes ignores the FILE: requirement and outputs a bare code block.
+    # Map the first html block → index.html, first js block → js/main.js
+    lang_map = {"html": "index.html", "javascript": "js/main.js", "js": "js/main.js"}
+    bare_re = re.compile(r'```(html|javascript|js)[ \t]*\n(.*?)```', re.DOTALL | re.IGNORECASE)
+    for m in bare_re.finditer(content):
+        lang = m.group(1).lower()
+        code = m.group(2).rstrip()
+        if not code:
+            continue
+        filename = lang_map[lang]
+        if filename not in seen:
+            seen.add(filename)
+            files.append({"filename": filename, "content": code})
+
     return files
 
 
@@ -733,6 +760,9 @@ def build_ollama_messages(history: list[dict], agent: str, system: str) -> list[
 # ── Claude connectivity ───────────────────────────────────────────────────────
 
 async def check_claude_online() -> bool:
+    # Respect the manual disable toggle — don't waste an API call if disabled
+    if not _config.get("claude_enabled", True):
+        return False
     key = os.getenv("ANTHROPIC_API_KEY", "")
     if not key:
         return False
@@ -897,18 +927,20 @@ async def _ollama_json_call(agent: str, system: str, prompt: str, max_tokens: in
     """Non-streaming Ollama call for structured output (planning, classification, evaluation)."""
     model = OLLAMA_MODELS.get(agent, OLLAMA_MODELS["qwen"])
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=180.0) as client:
             r = await client.post(
                 f"{OLLAMA_BASE}/api/chat",
                 json={
                     "model":    model,
                     "messages": [
                         {"role": "system", "content": system},
-                        {"role": "user",   "content": prompt},
+                        # /no_think suppresses <think> blocks in Qwen models,
+                        # saving all num_predict tokens for actual output
+                        {"role": "user",   "content": "/no_think\n" + prompt},
                     ],
                     "stream":     False,
                     "keep_alive": KEEP_ALIVE,
-                    "options":    {"num_predict": max_tokens},
+                    "options":    {"num_predict": max_tokens, "num_ctx": 8192},
                 },
             )
         if r.status_code != 200:
@@ -924,28 +956,29 @@ async def _ollama_json_call(agent: str, system: str, prompt: str, max_tokens: in
 
 
 async def _master_json_call(system: str, prompt: str, max_tokens: int = 512) -> str:
-    """Route a structured JSON call to the active master model (Claude or Qwen)."""
+    """Route a structured JSON call to the active master model (Claude or Qwen).
+    If Claude is master but fails, automatically falls back to Qwen.
+    """
     if get_master_model() == "claude":
         key = os.getenv("ANTHROPIC_API_KEY", "")
-        if not key:
-            return ""
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                r = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                             "content-type": "application/json"},
-                    json={"model": "claude-sonnet-4-6", "max_tokens": max_tokens,
-                          "system": system,
-                          "messages": [{"role": "user", "content": prompt}]},
-                )
-            if r.status_code != 200:
-                logging.warning("_master_json_call(claude) HTTP %d", r.status_code)
-                return ""
-            return r.json().get("content", [{}])[0].get("text", "").strip()
-        except Exception as e:
-            logging.warning("_master_json_call(claude) error: %s", e)
-            return ""
+        if key:
+            try:
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    r = await client.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                                 "content-type": "application/json"},
+                        json={"model": "claude-sonnet-4-6", "max_tokens": max_tokens,
+                              "system": system,
+                              "messages": [{"role": "user", "content": prompt}]},
+                    )
+                if r.status_code == 200:
+                    return r.json().get("content", [{}])[0].get("text", "").strip()
+                logging.warning("_master_json_call(claude) HTTP %d — falling back to Qwen", r.status_code)
+            except Exception as e:
+                logging.warning("_master_json_call(claude) error: %s — falling back to Qwen", e)
+        # Fallback: Claude unavailable or failed, use Qwen
+        return await _ollama_json_call("qwen", system, prompt, max_tokens)
     else:
         return await _ollama_json_call("qwen", system, prompt, max_tokens)
 
@@ -1040,9 +1073,14 @@ async def detect_intent_in_project(message: str, project_name: str) -> str:
         chat   — general question unrelated to building this project
         Respond with ONLY that one word.
     """)
-    result = await _claude_classify(system, message, max_tokens=5)
-    word = result.lower().strip().rstrip('.')
-    return word if word in ("query", "build", "chat") else "chat"
+    result = await _claude_classify(system, message, max_tokens=20)
+    result_lower = result.lower()
+    # Check for keywords anywhere in the response (Qwen may add extra words)
+    if "build" in result_lower:
+        return "build"
+    if "query" in result_lower:
+        return "query"
+    return "chat"
 
 
 async def stream_project_query(ws: WebSocket, project_id: int, question: str,
@@ -1102,14 +1140,15 @@ async def claude_plan_project(project: dict, goal: str) -> list[dict]:
         reliably without making integration mistakes.
 
         AGENT ROLES — READ CAREFULLY:
-        - "deepseek" : PRIMARY CODER. Handles ALL code implementation — HTML, CSS, JS, Python,
-                       games, web apps, APIs, scripts. DeepSeek writes every file that contains code.
-                       Give it a precise spec and it will produce complete, working code.
-        - "qwen"     : SECONDARY. Config JSON, README.md, plain HTML shells (no JS), pure CSS files,
-                       documentation. Never assign JS game logic or complex code to qwen.
-        - "claude"   : DO NOT USE as a worker. Claude is the planner/orchestrator — not a coder.
-                       NEVER set assigned_to="claude" in your output. If you're tempted to, use
-                       "deepseek" instead. Claude writing code = expensive + truncated output.
+        CURRENTLY ENABLED AGENTS: {", ".join(get_enabled_agents())}
+        Only assign tasks to agents in the enabled list above.
+
+        - "deepseek" : PRIMARY CODER. Assign ALL files with code to deepseek — every .html, .js,
+                       .css, .py, .json with logic. DeepSeek is fast and reliable for code.
+        - "qwen"     : Use ONLY for pure documentation (README.md). Never assign .html, .js, .css,
+                       or any code file to qwen. If you are qwen, do NOT assign tasks to yourself
+                       unless deepseek is not in the enabled list.
+        - "claude"   : NEVER assign tasks to claude. Claude is planner/orchestrator only.
 
         ATOMIC TASK RULES (critical for quality):
         1. Each task produces at most ONE file, max ~250 lines of output.
@@ -1227,8 +1266,14 @@ async def claude_project_summary(project: dict, goal: str, tasks: list) -> str:
         f"IMPORTANT: Always end your summary with this exact line:\n"
         f"To play/test: open http://{SERVER_HOST}/play/{slug}/ in your browser"
     )
+    play_url = f"http://{SERVER_HOST}/play/{slug}/"
     summary = await _master_json_call(system, prompt, max_tokens=500)
-    return summary or f"Project '{project['name']}' completed with {len(tasks)} tasks.\nTo play/test: open http://{SERVER_HOST}/play/{slug}/ in your browser"
+    if not summary:
+        summary = f"Project '{project['name']}' completed with {len(tasks)} tasks."
+    # Always guarantee the correct browser URL is at the end, regardless of what the model wrote
+    if play_url not in summary:
+        summary = summary.rstrip() + f"\n\nTo play/test: {play_url}"
+    return summary
 
 # ── Orchestration loop ────────────────────────────────────────────────────────
 
@@ -1261,9 +1306,12 @@ async def run_orchestration(ws: WebSocket, project_id: int, goal: str, resume: b
     else:
         # ── Normal path: plan + create tasks ─────────────────────────────────
         save_project_message(project_id, "user", goal)
+        await ws.send_json({"type": "user", "content": goal, "timestamp": datetime.utcnow().isoformat()})
 
         # 1. Planning phase
-        await ws.send_json({"type": "orch_phase", "phase": "planning", "msg": "Claude is planning the project..."})
+        planner = get_master_model()
+        await ws.send_json({"type": "orch_phase", "phase": "planning",
+                            "msg": f"🧠 {planner.capitalize()} is planning the project..."})
 
         # 2. Get tasks from Claude
         tasks = await claude_plan_project(project, goal)
@@ -1328,7 +1376,7 @@ async def run_orchestration(ws: WebSocket, project_id: int, goal: str, resume: b
     update_project_status(project_id, "completed")
 
     # 13. Send complete (Open Project button shown by frontend)
-    await ws.send_json({"type": "orch_complete", "summary": summary})
+    await ws.send_json({"type": "orch_complete", "summary": summary, "slug": project.get("slug", "")})
 
     # 14. Send token/time stats
     await ws.send_json({"type": "orch_stats", **stats.to_summary()})
@@ -1341,6 +1389,31 @@ async def _execute_task(ws: WebSocket, project: dict, task: dict, goal: str,
     tid = task["id"]
     tnum = task["task_number"]
     agent = task["assigned_to"]
+
+    # Hard reroute: if qwen or claude is assigned a code task and deepseek is available, use deepseek
+    code_exts = {".html", ".js", ".ts", ".css", ".py", ".json", ".jsx", ".tsx"}
+    files_to_create = task.get("files_to_create", [])
+    has_code_files = any(
+        Path(f).suffix.lower() in code_exts for f in files_to_create
+    ) if files_to_create else False
+    disabled_set = set(_config.get("disabled_agents", []))
+    if agent in ("qwen", "claude") and has_code_files and "deepseek" not in disabled_set:
+        logging.info("Task %d: rerouting code task from '%s' to 'deepseek'", tnum, agent)
+        agent = "deepseek"
+
+    # Respect disabled agents: reroute to first available fallback
+    disabled = disabled_set
+    if agent in disabled:
+        enabled = get_enabled_agents()
+        fallback = next((a for a in ["deepseek", "qwen", "claude"] if a not in disabled), None)
+        if fallback:
+            logging.info("Task %d: agent '%s' is disabled, rerouting to '%s'", tnum, agent, fallback)
+            await ws.send_json({"type": "status", "message": f"⚙️ {agent} is disabled, routing task to {fallback}..."})
+            agent = fallback
+        else:
+            logging.error("Task %d: all agents disabled, cannot execute", tnum)
+            await ws.send_json({"type": "orch_task_done", "task_id": tid, "files": [], "error": "All agents disabled"})
+            return
 
     # a. Update status
     update_task(tid, status="in_progress")
@@ -1413,6 +1486,23 @@ async def _execute_task(ws: WebSocket, project: dict, task: dict, goal: str,
 
     # f. Done streaming — record token usage
     await ws.send_json({"type": "done", "agent": agent})
+
+    # f2. Detect Ollama connection failure — fall back to master model
+    if agent != "claude" and "[Ollama error:" in full:
+        logging.warning("Task %d: %s unavailable, retrying with master model", tnum, agent)
+        await ws.send_json({"type": "status", "message": f"⚠️ {agent} unavailable, falling back to master model..."})
+        full = ""
+        tok = {}
+        fallback_agent = get_master_model()
+        await ws.send_json({"type": "typing", "agent": fallback_agent})
+        async for chunk in stream_master(history, system_prompt=worker_system, cancel_event=cancel_event, usage=tok, max_tokens=8192):
+            if cancel_event and cancel_event.is_set():
+                break
+            await ws.send_json({"type": "chunk", "agent": fallback_agent, "content": chunk})
+            full += chunk
+        await ws.send_json({"type": "done", "agent": fallback_agent})
+        agent = fallback_agent
+
     if stats:
         stats.record(agent,
                      tok.get("input_tokens", len(worker_prompt) // 4),
@@ -1491,15 +1581,16 @@ def _build_worker_system(project: dict, task_context: str = "") -> str:
     skills_block = _load_skills(task_context) if task_context else ""
     return textwrap.dedent(f"""\
         You are implementing a specific task for project '{project['name']}'.
-        Write clean, production-quality code. Output ONLY file content — no explanations, no preamble.
+        Write clean, production-quality code.
 
-        FILE MARKER FORMAT (REQUIRED):
-        Every file you write must start with a comment on the VERY FIRST LINE:
-          JavaScript/TypeScript: // FILE: relative/path/to/file.js
-          CSS:                   /* FILE: relative/path/to/file.css */
-          HTML:                  <!-- FILE: relative/path/to/file.html -->
-          Python:                # FILE: relative/path/to/file.py
-        This is how files get saved — if you omit it, nothing gets written.
+        ⚠️  CRITICAL — FILE MARKER REQUIRED ON FIRST LINE OF EVERY CODE BLOCK:
+        The VERY FIRST LINE inside each ``` block MUST be the file path comment:
+          HTML:       <!-- FILE: index.html -->
+          JavaScript: // FILE: js/game.js
+          CSS:        /* FILE: css/style.css */
+          Python:     # FILE: script.py
+        Without this marker, the file WILL NOT BE SAVED. Do not skip it.
+        Do NOT write any explanation text before or after code blocks.
 
         QUALITY RULES:
         - Code must be COMPLETE and immediately runnable — NO TODOs, NO placeholders, NO "add logic here".
@@ -1825,10 +1916,12 @@ async def status():
 @app.get("/settings")
 async def get_settings():
     key = os.getenv("ANTHROPIC_API_KEY", "")
+    disabled = set(_config.get("disabled_agents", []))
     return {
         "claude": {
             "api_key_set": bool(key),
             "api_key_preview": f"sk-ant-...{key[-4:]}" if len(key) > 8 else "",
+            "enabled": "claude" not in disabled,
         },
         "deepseek": {
             "model": OLLAMA_MODELS["deepseek"],
@@ -1836,6 +1929,7 @@ async def get_settings():
             "speed": "40.9 tok/s",
             "size": "11.1 GB",
             "quant": "Q5_K_S",
+            "enabled": "deepseek" not in disabled,
         },
         "qwen": {
             "model": OLLAMA_MODELS["qwen"],
@@ -1843,8 +1937,32 @@ async def get_settings():
             "speed": "13.3 tok/s",
             "size": "6.6 GB",
             "quant": "Q4_K_M",
+            "enabled": "qwen" not in disabled,
         },
     }
+
+
+@app.post("/settings/agent")
+async def toggle_agent(data: dict):
+    """Enable or disable an individual agent.
+
+    Body: {"agent": "deepseek"|"qwen"|"claude", "enabled": true|false}
+    """
+    agent = data.get("agent", "")
+    if agent not in ("claude", "deepseek", "qwen"):
+        return {"error": "unknown agent"}
+    enabled = bool(data.get("enabled", True))
+    disabled: set = set(_config.get("disabled_agents", []))
+    if not enabled:
+        disabled.add(agent)
+    else:
+        disabled.discard(agent)
+    _config["disabled_agents"] = list(disabled)
+    # Keep claude_enabled in sync so master model routing works correctly
+    if agent == "claude":
+        _config["claude_enabled"] = enabled
+    logging.info("Agent toggle: %s enabled=%s disabled_agents=%s", agent, enabled, _config["disabled_agents"])
+    return {"agent": agent, "enabled": enabled, "disabled_agents": _config["disabled_agents"]}
 
 
 @app.post("/settings/apikey")
@@ -2138,14 +2256,23 @@ async def ws_endpoint(ws: WebSocket):
                 continue
 
             claude_online = await check_claude_online()
+            # Intent detection uses the master model (_master_json_call routes to Qwen when
+            # Claude is disabled), so we always run it regardless of claude_online state.
+            master_available = True  # _master_json_call always has a fallback (qwen)
 
             # In project context: smart routing
             if project_id_ctx:
                 proj = get_project(project_id_ctx)
-                if proj and claude_online:
-                    routing = await detect_intent_in_project(content, proj["name"])
-                else:
+                if not proj:
                     routing = "chat"
+                else:
+                    prior_tasks_quick = get_all_tasks(project_id_ctx)
+                    if not prior_tasks_quick:
+                        # No tasks at all — fresh project or planning previously failed.
+                        # Skip intent detection and go straight to build.
+                        routing = "build"
+                    else:
+                        routing = await detect_intent_in_project(content, proj["name"])
 
                 if routing == "query":
                     # Answer the question using project context
@@ -2155,10 +2282,8 @@ async def ws_endpoint(ws: WebSocket):
                     continue
 
                 if routing == "build":
-                    prior_msgs = load_project_messages(project_id_ctx, limit=1)
-                    prior_tasks = get_all_tasks(project_id_ctx)
-                    if not prior_msgs and not prior_tasks:
-                        # Fresh project — initial spec, start immediately
+                    if not prior_tasks_quick:
+                        # No tasks yet (fresh project, or previous planning failed) — start immediately
                         await _run_task(run_orchestration(ws, project_id_ctx, content, cancel_event=cancel_event))
                         if cancel_event.is_set():
                             reset_stuck_tasks(project_id_ctx)
@@ -2180,8 +2305,8 @@ async def ws_endpoint(ws: WebSocket):
 
                 # routing == "chat" — fall through to normal chat below
 
-            # General intent detection (no project context)
-            elif claude_online:
+            # General intent detection (no project context) — always run via master model
+            elif master_available:
                 intent = await detect_intent(content)
                 if intent.get("type") == "project_new":
                     await ws.send_json({

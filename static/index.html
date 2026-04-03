@@ -234,6 +234,26 @@ body {
   background: var(--surface-2);
   border: 1px solid var(--border);
   white-space: nowrap;
+  transition: opacity 0.2s, border-color 0.2s;
+}
+/* Cloud LLMs (Claude) — subtle violet tint */
+.status-pill.cloud {
+  border-color: rgba(124,58,237,0.4);
+  background: rgba(124,58,237,0.08);
+}
+/* Local LLMs (DeepSeek, Qwen) — subtle cyan/surface tint */
+.status-pill.local {
+  border-color: rgba(8,145,178,0.3);
+  background: rgba(8,145,178,0.06);
+}
+.status-pill.local.qwen {
+  border-color: rgba(217,119,6,0.3);
+  background: rgba(217,119,6,0.06);
+}
+/* Disabled state */
+.status-pill.disabled {
+  opacity: 0.38;
+  filter: grayscale(0.6);
 }
 
 .dot {
@@ -242,8 +262,9 @@ body {
   background: #3f3f46;
   transition: background 0.3s;
 }
-.dot.online  { background: #22c55e; }
-.dot.offline { background: #ef4444; }
+.dot.online   { background: #22c55e; }
+.dot.offline  { background: #ef4444; }
+.dot.disabled { background: #52525b; }
 
 /* ── Task bar (project mode) ──────────────────────────────────────────────── */
 .task-bar {
@@ -763,6 +784,25 @@ textarea::placeholder { color: var(--muted); }
   padding: 3px 10px; border-radius: 20px; color: var(--muted);
 }
 
+/* ── Agent enable/disable toggle ──────────────────────────────────────────── */
+.agent-toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 0 12px; border-bottom: 1px solid var(--border); margin-bottom: 12px;
+}
+.toggle-switch { position: relative; display: inline-block; cursor: pointer; }
+.toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+.toggle-track {
+  display: block; width: 40px; height: 22px; border-radius: 11px;
+  background: #3f3f46; transition: background 0.2s;
+}
+.toggle-switch input:checked + .toggle-track { background: #22c55e; }
+.toggle-thumb {
+  position: absolute; top: 3px; left: 3px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; transition: transform 0.2s; pointer-events: none;
+}
+.toggle-switch input:checked + .toggle-track .toggle-thumb { transform: translateX(18px); }
+
 /* Plus button */
 .plus-btn {
   width: 28px; height: 28px; border-radius: 50%;
@@ -999,15 +1039,15 @@ select.project-select {
   </div>
 
   <div class="status-row">
-    <div class="status-pill" onclick="openModal('claude')" style="cursor:pointer" title="Claude settings">
+    <div class="status-pill cloud" id="pill-claude" onclick="openModal('claude')" style="cursor:pointer" title="Claude · Cloud">
       <div class="dot" id="dot-claude"></div>
       <span>Claude</span>
     </div>
-    <div class="status-pill" onclick="openModal('deepseek')" style="cursor:pointer" title="DeepSeek settings">
+    <div class="status-pill local" id="pill-deepseek" onclick="openModal('deepseek')" style="cursor:pointer" title="DeepSeek · Local">
       <div class="dot online" id="dot-deepseek"></div>
       <span>DeepSeek</span>
     </div>
-    <div class="status-pill" onclick="openModal('qwen')" style="cursor:pointer" title="Qwen settings">
+    <div class="status-pill local qwen" id="pill-qwen" onclick="openModal('qwen')" style="cursor:pointer" title="Qwen · Local">
       <div class="dot online" id="dot-qwen"></div>
       <span>Qwen</span>
     </div>
@@ -1403,6 +1443,9 @@ function connect() {
   ws.onopen = () => {
     if (reconnTimer) { clearTimeout(reconnTimer); reconnTimer = null; }
     refreshProjectList();
+    syncPillStates();
+    // If we were viewing a project when we disconnected, reload it to restore task bar state
+    if (activeProjectId) loadProject(activeProjectId);
   };
 
   ws.onclose = () => {
@@ -1468,9 +1511,10 @@ function handle(msg) {
       break;
     case 'orch_complete':
       appendOrchStatus('✅ Build complete!\n\n' + msg.summary);
-      showOpenProjectBtn(activeProject && activeProject.slug);
+      { const slug = msg.slug || (activeProject && activeProject.slug);
+        showOpenProjectBtn(slug);
+        if (activeProject) activeProject.status = 'completed'; }
       setSending(false);
-      if (activeProject) activeProject.status = 'completed';
       refreshProjectList();
       break;
 
@@ -2134,8 +2178,17 @@ function renderClaudeModal(cfg) {
   document.getElementById('modal-agent-type').textContent = 'Cloud \u00B7 Anthropic API';
 
   const preview = cfg.api_key_set ? cfg.api_key_preview : '';
+  const isEnabled = cfg.enabled !== false;
 
   document.getElementById('modal-body').innerHTML = `
+    <div class="agent-toggle-row">
+      <span class="field-label" style="margin:0">Use in tasks</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="agent-enabled-toggle" ${isEnabled ? 'checked' : ''}
+               onchange="setAgentEnabled('claude', this.checked)">
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      </label>
+    </div>
     <div>
       <div class="field-label">Anthropic API Key</div>
       <div class="key-wrap">
@@ -2212,7 +2265,17 @@ function renderLocalModal(agent, cfg) {
   document.getElementById('modal-agent-name').textContent = info.label;
   document.getElementById('modal-agent-type').textContent = 'Local \u00B7 Mac Mini \u00B7 Ollama';
 
+  const isEnabled = cfg.enabled !== false;
+
   document.getElementById('modal-body').innerHTML = `
+    <div class="agent-toggle-row">
+      <span class="field-label" style="margin:0">Use in tasks</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="agent-enabled-toggle" ${isEnabled ? 'checked' : ''}
+               onchange="setAgentEnabled('${agent}', this.checked)">
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      </label>
+    </div>
     <div class="info-grid">
       <div class="info-row"><span>Model</span><span title="${cfg.model}">${cfg.model.length > 34 ? cfg.model.slice(0,34)+'\u2026' : cfg.model}</span></div>
       <div class="info-row"><span>Size</span><span>${cfg.size}</span></div>
@@ -2238,6 +2301,39 @@ async function testLocal(agent) {
   el.textContent = res.online
     ? `${AGENTS[agent].label} is loaded and ready`
     : 'Cannot reach model -- is Ollama running?';
+}
+
+async function setAgentEnabled(agent, enabled) {
+  await fetch('/settings/agent', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ agent, enabled }),
+  });
+  invalidateSettings();
+  applyPillState(agent, enabled);
+  // Special: if disabling Claude, mirror to master model toggle
+  if (agent === 'claude') updateStatus(enabled && prevOnline);
+}
+
+function applyPillState(agent, enabled) {
+  const pill = document.getElementById(`pill-${agent}`);
+  const dot  = document.getElementById(`dot-${agent}`);
+  if (!pill) return;
+  if (enabled) {
+    pill.classList.remove('disabled');
+    // restore dot — for local agents show online, for claude keep current status dot
+    if (agent !== 'claude') dot.className = 'dot online';
+  } else {
+    pill.classList.add('disabled');
+    dot.className = 'dot disabled';
+  }
+}
+
+async function syncPillStates() {
+  const settings = await fetch('/settings').then(r => r.json());
+  ['claude', 'deepseek', 'qwen'].forEach(a => {
+    applyPillState(a, settings[a]?.enabled !== false);
+  });
 }
 
 // ── Plus modal ────────────────────────────────────────────────────────────────
